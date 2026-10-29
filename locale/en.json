@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Design Annotation",
+    "description": "Annotate HTML prototypes: open one, pick an element, leave a note, and see it again whenever the flow reaches that state. Notes are stored in a sidecar file next to the prototype and can be handed straight to the AI."
+  }
+}

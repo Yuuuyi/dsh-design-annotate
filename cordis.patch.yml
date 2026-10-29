@@ -1,0 +1,15 @@
+# Design annotation bundle.
+#
+# One row: this package. The Host half publishes the same-origin
+# `/annotate-api` routes (prototype serving, injected picker script, sidecar
+# annotation store); the Client half adds the `设计标注` panel and its sidebar row.
+#
+# Optional config:
+#   defaultFile  absolute path of a prototype to open on first use
+#   roots        absolute directories the panel may read; empty means unrestricted
+- insert:
+    - id: annotate
+      name: '@local/dsh-client-plugin-annotate'
+      config:
+        defaultFile: ''
+        roots: []
