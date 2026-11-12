@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-client-plugin-annotate",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "private": true,
   "type": "module",
   "description": "Design annotation for HTML prototypes: open a prototype in a panel, pick an element, leave a note, and see it again whenever the flow reaches that state.",

@@ -199,6 +199,178 @@ async function scanHtml(root, depth, out) {
   }
 }
 
+/** Content type by extension for assets served from a prototype directory. */
+const MIME_BY_EXT = {
+  '.html': 'text/html; charset=utf-8',
+  '.htm': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.ico': 'image/x-icon',
+  '.bmp': 'image/bmp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm',
+}
+
+function mimeFor(filePath) {
+  return MIME_BY_EXT[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream'
+}
+
+/** Opaque id for a prototype directory; reversible, no filesystem lookup needed. */
+function rootIdFor(directory) {
+  return Buffer.from(directory, 'utf8').toString('base64url')
+}
+
+function directoryFromRootId(id) {
+  try {
+    const decoded = Buffer.from(id, 'base64url').toString('utf8')
+    return decoded.startsWith('/') ? decoded : ''
+  } catch (error) {
+    return ''
+  }
+}
+
+/** Point relative asset URLs at the Host's directory route. */
+function injectBase(html, baseHref) {
+  if (/<base\b/i.test(html)) return html
+  const tag = '<base href="' + baseHref + '">'
+  const head = /<head\b[^>]*>/i.exec(html)
+  if (head !== null) {
+    const at = head.index + head[0].length
+    return html.slice(0, at) + tag + html.slice(at)
+  }
+  const htmlOpen = /<html\b[^>]*>/i.exec(html)
+  if (htmlOpen !== null) {
+    const at = htmlOpen.index + htmlOpen[0].length
+    return html.slice(0, at) + tag + html.slice(at)
+  }
+  return tag + html
+}
+
+function isRelativeAsset(url) {
+  if (typeof url !== 'string' || url === '') return false
+  if (/^(?:[a-z]+:|\/\/|#)/i.test(url)) return false
+  if (url.startsWith('/')) return false
+  return true
+}
+
+function decodeUrl(value) {
+  try {
+    return decodeURIComponent(value)
+  } catch (error) {
+    return value
+  }
+}
+
+const MAX_INLINE_BYTES = 12 * 1024 * 1024
+
+async function readLocalAsset(directory, url, cache) {
+  const clean = decodeUrl(String(url).split('#')[0].split('?')[0])
+  if (clean === '') return null
+  const filePath = path.resolve(directory, clean)
+  if (filePath !== directory && !filePath.startsWith(directory + path.sep)) return null
+  if (cache.has(filePath)) return cache.get(filePath)
+  let buffer = null
+  try {
+    const info = await stat(filePath)
+    if (info.isFile() && info.size <= MAX_INLINE_BYTES) buffer = await readFile(filePath)
+  } catch (error) {
+    buffer = null
+  }
+  cache.set(filePath, buffer)
+  return buffer
+}
+
+async function inlineCssUrls(css, directory, cache) {
+  let out = css
+  const matches = Array.from(css.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi))
+  for (const match of matches) {
+    if (!isRelativeAsset(match[2])) continue
+    const bytes = await readLocalAsset(directory, match[2], cache)
+    if (bytes === null) continue
+    const filePath = path.resolve(directory, decodeUrl(match[2].split('#')[0].split('?')[0]))
+    const data = 'data:' + mimeFor(filePath) + ';base64,' + bytes.toString('base64')
+    out = out.split(match[0]).join('url("' + data + '")')
+  }
+  return out
+}
+
+/**
+ * Make the exported document self-contained: images, stylesheets, scripts and
+ * CSS `url()` references become data URIs / inline blocks. Exported files open
+ * from `file://` elsewhere, where the Host's asset route no longer exists.
+ */
+async function inlineLocalAssets(html, directory) {
+  const cache = new Map()
+  let out = html
+
+  /* Linked stylesheets */
+  for (const match of Array.from(out.matchAll(/<link\b[^>]*>/gi))) {
+    const tag = match[0]
+    if (!/rel\s*=\s*["']?stylesheet/i.test(tag)) continue
+    const href = /\bhref\s*=\s*["']([^"']+)["']/i.exec(tag)
+    if (href === null || !isRelativeAsset(href[1])) continue
+    const bytes = await readLocalAsset(directory, href[1], cache)
+    if (bytes === null) continue
+    const inlined = await inlineCssUrls(bytes.toString('utf8'), directory, cache)
+    out = out.split(tag).join('<style>\n' + inlined + '\n</style>')
+  }
+
+  /* External scripts */
+  for (const match of Array.from(out.matchAll(/<script\b[^>]*\bsrc\s*=\s*["'][^"']+["'][^>]*>\s*<\/script>/gi))) {
+    const tag = match[0]
+    const src = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(tag)
+    if (src === null || !isRelativeAsset(src[1])) continue
+    const bytes = await readLocalAsset(directory, src[1], cache)
+    if (bytes === null) continue
+    const body = bytes.toString('utf8').replace(/<\/script/gi, '<\\/script')
+    out = out.split(tag).join('<script>\n' + body + '\n</script>')
+  }
+
+  /* Media sources */
+  for (const match of Array.from(out.matchAll(/<(img|source|video|audio)\b[^>]*>/gi))) {
+    const tag = match[0]
+    const src = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(tag)
+    if (src === null || !isRelativeAsset(src[1])) continue
+    const bytes = await readLocalAsset(directory, src[1], cache)
+    if (bytes === null) continue
+    const filePath = path.resolve(directory, decodeUrl(src[1].split('#')[0].split('?')[0]))
+    const data = 'data:' + mimeFor(filePath) + ';base64,' + bytes.toString('base64')
+    out = out.split(tag).join(tag.split(src[1]).join(data))
+  }
+
+  /* Inline <style> blocks and style attributes */
+  for (const match of Array.from(out.matchAll(/<style\b([^>]*)>([\s\S]*?)<\/style>/gi))) {
+    const inlined = await inlineCssUrls(match[2], directory, cache)
+    if (inlined !== match[2]) {
+      out = out.replace(match[0], '<style' + match[1] + '>' + inlined + '</style>')
+    }
+  }
+  for (const match of Array.from(out.matchAll(/\bstyle\s*=\s*["']([^"']*url\([^"']*)["']/gi))) {
+    const inlined = await inlineCssUrls(match[1], directory, cache)
+    if (inlined !== match[1]) out = out.replace(match[0], 'style="' + inlined + '"')
+  }
+
+  return out
+}
+
 /** Insert a chunk before `</body>`, appending when the document has no body end. */
 function injectBeforeBody(html, chunk) {
   const index = html.toLowerCase().lastIndexOf('</body>')
@@ -400,7 +572,7 @@ function createAnnotate(ctx, rawConfig) {
 
   /** Build the self-contained annotated document for one prototype. */
   async function exportDocument(target) {
-    const raw = await readFile(target.file, 'utf8')
+    const raw = await inlineLocalAssets(await readFile(target.file, 'utf8'), path.dirname(target.file))
     const document = await loadDocument(target)
     const viewer = await readFile(path.join(here, 'export-viewer.js'), 'utf8')
     return buildExport(raw, viewer, {
@@ -431,13 +603,79 @@ function createAnnotate(ctx, rawConfig) {
       if (route === '/serve' && req.method === 'GET') {
         const target = resolvePrototype(config, url.searchParams.get('path'))
         const raw = await readFile(target.file, 'utf8')
-        const html = injectBridge(stripExportBlock(raw))
+        const baseHref = API_PATH + '/root/' + rootIdFor(path.dirname(target.file)) + '/'
+        const html = injectBridge(stripExportBlock(injectBase(raw, baseHref)))
         res.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
           'content-length': Buffer.byteLength(html),
         })
         res.end(html)
+        return
+      }
+
+      /* Relative images / styles / fonts / sub-pages of a prototype. */
+      if (route.startsWith('/root/') && (req.method === 'GET' || req.method === 'HEAD')) {
+        const rest = route.slice('/root/'.length)
+        const slash = rest.indexOf('/')
+        const directory = directoryFromRootId(slash === -1 ? rest : rest.slice(0, slash))
+        if (directory === '') {
+          sendText(res, 404, 'not found')
+          return
+        }
+        if (config.roots.length > 0) {
+          const allowed = config.roots.some((root) => directory === root || directory.startsWith(root + path.sep))
+          if (!allowed) {
+            sendText(res, 403, 'forbidden')
+            return
+          }
+        }
+        const relative = slash === -1 ? '' : decodeUrl(rest.slice(slash + 1))
+        if (relative === '') {
+          sendText(res, 404, 'not found')
+          return
+        }
+        const assetPath = path.resolve(directory, relative)
+        if (assetPath !== directory && !assetPath.startsWith(directory + path.sep)) {
+          sendText(res, 403, 'forbidden')
+          return
+        }
+        let info
+        try {
+          info = await stat(assetPath)
+        } catch (error) {
+          sendText(res, 404, 'not found')
+          return
+        }
+        if (!info.isFile()) {
+          sendText(res, 404, 'not found')
+          return
+        }
+        if (info.size > 64 * 1024 * 1024) {
+          sendText(res, 413, 'asset too large')
+          return
+        }
+        const isHtml = /\.html?$/i.test(assetPath)
+        if (isHtml) {
+          const raw = await readFile(assetPath, 'utf8')
+          const baseHref = API_PATH + '/root/' + rootIdFor(directory) + '/'
+          const html = injectBridge(stripExportBlock(injectBase(raw, baseHref)))
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+            'content-length': Buffer.byteLength(html),
+          })
+          res.end(html)
+          return
+        }
+        const bytes = await readFile(assetPath)
+        res.writeHead(200, {
+          'content-type': mimeFor(assetPath),
+          'cache-control': 'no-store',
+          'content-length': bytes.length,
+        })
+        if (req.method === 'HEAD') res.end()
+        else res.end(bytes)
         return
       }
 
